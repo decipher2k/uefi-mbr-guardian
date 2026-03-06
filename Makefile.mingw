@@ -12,6 +12,7 @@ GNUEFI_LIB	= $(GNUEFI_SRC)/x86_64/lib
 CC		= gcc
 LD		= ld
 AR		= ar
+OBJCOPY		= objcopy
 
 CFLAGS		= -I$(GNUEFI_INC) \
 		  -I$(GNUEFI_INC)/$(ARCH) \
@@ -66,9 +67,39 @@ $(BUILDDIR)/main.o: $(SRCDIR)/main.c $(SRCDIR)/gfx.h $(SRCDIR)/font8x16.h | $(BU
 $(BUILDDIR)/gfx.o: $(SRCDIR)/gfx.c $(SRCDIR)/gfx.h $(SRCDIR)/font8x16.h | $(BUILDDIR)
 	$(CC) $(CFLAGS) -o $@ $<
 
-# Link directly to .efi PE/COFF file (no objcopy step needed)
-$(BUILDDIR)/$(TARGET): $(OBJECTS)
+# Link to intermediate PE/DLL, then strip DLL flag and debug sections
+# via objcopy to produce a clean EFI application image.
+# MinGW's -shared is needed to emit the .reloc section (required by UEFI
+# for image relocation), but it also sets IMAGE_FILE_DLL in the PE
+# characteristics -- which causes many firmwares to reject the binary.
+# MinGW's objcopy lacks the efi-app-x86_64 target, so we use pei-x86-64
+# and then patch the DLL flag out of the PE Characteristics field with a
+# small Python one-liner.
+
+OBJCOPY_FLAGS	= -j .text \
+		  -j .sdata \
+		  -j .data \
+		  -j .rdata \
+		  -j .dynamic \
+		  -j .dynsym \
+		  -j .rel \
+		  -j .rela \
+		  -j .reloc \
+		  --target=pei-x86-64
+
+$(BUILDDIR)/mbr-guardian.dll: $(OBJECTS)
 	$(LD) $(LDFLAGS) $(OBJECTS) -o $@ $(LIBS)
+
+# Strip sections, then clear IMAGE_FILE_DLL (bit 13) in PE Characteristics
+$(BUILDDIR)/$(TARGET): $(BUILDDIR)/mbr-guardian.dll
+	$(OBJCOPY) $(OBJCOPY_FLAGS) $< $@
+	python3 -c "\
+	import struct, sys; \
+	f=open(sys.argv[1],'r+b'); \
+	f.seek(0x3C); pe=struct.unpack('<I',f.read(4))[0]; \
+	f.seek(pe+22); ch=struct.unpack('<H',f.read(2))[0]; \
+	f.seek(pe+22); f.write(struct.pack('<H',ch & ~0x2000)); \
+	f.close()" $@
 	@echo ""
 	@echo "================================================"
 	@echo "  MBR Guardian v2.0 - Build Complete (MinGW)"

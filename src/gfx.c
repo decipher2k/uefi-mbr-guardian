@@ -35,6 +35,7 @@ GFX_CONTEXT gGfx;
 MOUSE_STATE gMouse;
 
 static EFI_BOOT_SERVICES               *gBS_gfx;
+static EFI_SYSTEM_TABLE                 *gST_gfx;
 static EFI_SIMPLE_POINTER_PROTOCOL     *gPointer = NULL;
 static COLOR                           *cursor_save = NULL; /* Under-cursor backup */
 
@@ -51,6 +52,7 @@ gfx_init(EFI_SYSTEM_TABLE *st, EFI_BOOT_SERVICES *bs)
     EFI_HANDLE *handles = NULL;
 
     gBS_gfx = bs;
+    gST_gfx = st;
 
     /* Locate GOP */
     status = bs->LocateHandleBuffer(
@@ -1017,8 +1019,13 @@ ui_dialog_yesno(const CHAR16 *title, const CHAR16 *message)
 
         /* Keyboard */
         EFI_INPUT_KEY key;
-        EFI_STATUS ks = gGfx.gop->Mode->Info->Version; /* dummy - need ST */
-        /* We handle keyboard in main loop, return via ESC=no, Enter=yes */
+        EFI_STATUS ks = gST_gfx->ConIn->ReadKeyStroke(gST_gfx->ConIn, &key);
+        if (!EFI_ERROR(ks)) {
+            if (key.UnicodeChar == L'\r' || key.UnicodeChar == L'y' || key.UnicodeChar == L'Y')
+                return 1;
+            if (key.ScanCode == 0x17 || key.UnicodeChar == L'n' || key.UnicodeChar == L'N') /* ESC */
+                return 0;
+        }
     }
 }
 

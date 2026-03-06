@@ -952,8 +952,8 @@ show_hexdump(UINTN snap_idx)
         EFI_STATUS ks = gST->ConIn->ReadKeyStroke(gST->ConIn, &key);
         if (!EFI_ERROR(ks)) {
             if (key.ScanCode == 0x17) return; /* ESC */
-            if (key.ScanCode == 0x02) { scroll -= 40; if (scroll < 0) scroll = 0; }
-            if (key.ScanCode == 0x01) { scroll += 40; if (scroll > max_scroll) scroll = max_scroll; }
+            if (key.ScanCode == 0x01) { scroll -= 40; if (scroll < 0) scroll = 0; }  /* Up */
+            if (key.ScanCode == 0x02) { scroll += 40; if (scroll > max_scroll) scroll = max_scroll; }  /* Down */
         }
     }
 }
