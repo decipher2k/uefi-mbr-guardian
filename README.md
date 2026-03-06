@@ -102,9 +102,79 @@ sudo pacman -S gnu-efi-libs          # Arch
 # Compile
 make
 
+# Optional: verify required sections are present in the final EFI image
+objdump -h build/mbr-guardian.efi | grep -E '\\.(text|data|rodata|reloc|rela)'
+
 # Install (creates boot entry automatically)
 sudo make install ESP=/boot/efi
 ```
+
+If you still see a black screen at launch, rebuild from a clean tree and re-check sections:
+
+```bash
+make clean && make
+objdump -h build/mbr-guardian.efi | grep -E '\\.(rodata|reloc|rela)'
+```
+
+Try the alternate ABI build once (some toolchain/firmware combinations need it):
+
+```bash
+make clean && make USE_MS_ABI=0
+sudo make install ESP=/boot/efi
+```
+
+If it is still black, run a text-only diagnostic build (disables GOP completely):
+
+```bash
+make clean && make NO_GFX_BOOT=1
+sudo make install ESP=/boot/efi
+```
+
+Expected result: you should see startup text and a "graphics disabled" message.
+
+If it is still black even in text-only mode, test without `InitializeLib`:
+
+```bash
+make clean && make NO_GFX_BOOT=1 SKIP_INITIALIZELIB=1
+sudo make install ESP=/boot/efi
+```
+
+Expected result: you should see startup text and an "InitializeLib skipped" message.
+
+If screen output stays black in every mode, run a pure entry-point reset test:
+
+```bash
+make clean && make ENTRY_RESET_TEST=1
+sudo make install ESP=/boot/efi
+```
+
+Expected result: selecting `MBR Guardian` should immediately reboot the machine.
+If it does not reboot, firmware is not executing this binary path.
+
+Also verify you are booting the updated binary (not an older copy):
+
+```bash
+sudo ls -l /boot/efi/EFI/mbr-guardian/mbr-guardian.efi
+sudo ls -l /boot/efi/EFI/BOOT/BOOTX64.EFI
+sudo efibootmgr -v | grep -i 'MBR Guardian\|mbr-guardian.efi\|BOOTX64.EFI'
+```
+
+If multiple `MBR Guardian` entries exist on different partitions, delete stale ones and recreate one:
+
+```bash
+sudo efibootmgr -v | grep -i 'MBR Guardian'
+# Example cleanup (replace #### with entry numbers shown above)
+sudo efibootmgr -b #### -B
+sudo efibootmgr -c -d /dev/nvme0n1 -p 3 -l '\EFI\mbr-guardian\mbr-guardian.efi' -L 'MBR Guardian'
+```
+
+To verify whether the EFI app executes at all (even with a black screen), check the boot marker variable:
+
+```bash
+ls /sys/firmware/efi/efivars | grep -i MBRGSeen
+```
+
+Boot once into `MBR Guardian`, reboot back to Linux, and run the command again. If `MBRGSeen-*` appears (or keeps changing), the app reached `efi_main` and the failure is later in startup.
 
 ### Windows Installation
 

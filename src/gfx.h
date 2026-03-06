@@ -148,6 +148,7 @@ typedef struct {
     UINT32  screen_w;
     UINT32  screen_h;
     UINT32  stride;         /* Pixels per scanline */
+    UINTN   fb_size;        /* Size in bytes of GOP framebuffer */
     COLOR   *framebuf;      /* Back buffer */
     COLOR   *screen;        /* Direct GOP framebuffer pointer */
 } GFX_CONTEXT;
@@ -172,6 +173,10 @@ void       gfx_shutdown(void);
 
 void gfx_clear(COLOR c);
 void gfx_flip(void);       /* Copy backbuffer to screen */
+void gfx_flip_rect(INT32 x, INT32 y, UINT32 w, UINT32 h); /* Copy small rect to screen */
+void gfx_begin_frame(void);/* Reset dirty tracking for new frame */
+void gfx_cache_bg(void);   /* Snapshot framebuffer as cached background */
+void gfx_restore_bg(void); /* Restore cached background (fast memcpy) */
 
 /* ------------------------------------------------------------------ */
 /*  Drawing primitives                                                 */
@@ -219,6 +224,9 @@ void        gfx_draw_icon_scaled(INT32 x, INT32 y, UINT32 target_w, UINT32 targe
 EFI_STATUS  mouse_init(EFI_BOOT_SERVICES *bs);
 void        mouse_poll(void);
 void        mouse_draw(void);
+void        mouse_save_under(void);
+void        mouse_restore_under(void);
+void        mouse_update_cursor(void);
 BOOLEAN     mouse_in_rect(const RECT *r);
 BOOLEAN     mouse_clicked_rect(const RECT *r);   /* Left click */
 BOOLEAN     mouse_rclicked_rect(const RECT *r);  /* Right click */

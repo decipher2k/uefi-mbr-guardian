@@ -112,6 +112,27 @@ static INT32                gScrollY = 0;
 /* Status message */
 static CHAR16               gStatusMsg[128] = L"Ready";
 
+/* Debug marker GUID: 5f0a6f09-7bf0-4b3d-9206-bdc7ca57f8c1 */
+static EFI_GUID             gMbrgDebugGuid =
+    { 0x5f0a6f09, 0x7bf0, 0x4b3d, { 0x92, 0x06, 0xbd, 0xc7, 0xca, 0x57, 0xf8, 0xc1 } };
+
+static void
+mark_boot_seen(void)
+{
+    UINT32 attrs;
+    UINT32 count = 0;
+    UINTN size = sizeof(count);
+
+    EFI_STATUS s = gRS->GetVariable(L"MBRGSeen", &gMbrgDebugGuid, &attrs, &size, &count);
+    if (EFI_ERROR(s) || size != sizeof(count)) count = 0;
+    count++;
+
+    gRS->SetVariable(
+        L"MBRGSeen", &gMbrgDebugGuid,
+        EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS,
+        sizeof(count), &count);
+}
+
 /* ------------------------------------------------------------------ */
 /*  Toolbar button IDs                                                 */
 /* ------------------------------------------------------------------ */
@@ -1530,11 +1551,20 @@ handle_button(UINT32 btn_id)
 /*  Main render loop                                                   */
 /* ------------------------------------------------------------------ */
 
+static BOOLEAN bg_cached = FALSE;
+
 static void
 render_frame(void)
 {
-    /* Background gradient */
-    gfx_gradient_v(0, 0, gGfx.screen_w, gGfx.screen_h, COL_BG_DARK, COL_BG_MID);
+    /* Restore cached background gradient instead of recomputing it */
+    gfx_begin_frame();
+    if (bg_cached) {
+        gfx_restore_bg();
+    } else {
+        gfx_gradient_v(0, 0, gGfx.screen_w, gGfx.screen_h, COL_BG_DARK, COL_BG_MID);
+        gfx_cache_bg();
+        bg_cached = TRUE;
+    }
 
     /* Title bar */
     ui_draw_titlebar(L"MBR Guardian", (UINT32)gTileCount, (UINT32)gDiskCount);
@@ -1567,8 +1597,7 @@ render_frame(void)
     /* Toolbar */
     ui_draw_toolbar(gToolbar, NUM_BUTTONS);
 
-    /* Mouse cursor (drawn last, on top) */
-    mouse_draw();
+    /* Cursor is drawn separately after gfx_flip for efficient updates */
 }
 
 /* ------------------------------------------------------------------ */
@@ -1586,15 +1615,27 @@ efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *systab)
     gRS = systab->RuntimeServices;
     gImageHandle = image_handle;
 
+#ifdef MBRG_ENTRY_RESET_TEST
+    gRS->ResetSystem(EfiResetWarm, EFI_SUCCESS, 0, NULL);
+    for (;;) { }
+#endif
+
+    mark_boot_seen();
+
     InitializeLib(image_handle, systab);
 
     /* Initialize graphics */
     status = gfx_init(systab, gBS);
     if (EFI_ERROR(status)) {
         /* Fallback to text mode */
+        systab->ConOut->Reset(systab->ConOut, TRUE);
+        systab->ConOut->SetMode(systab->ConOut, 0);
+        systab->ConOut->ClearScreen(systab->ConOut);
         systab->ConOut->OutputString(systab->ConOut,
             L"ERROR: Graphics initialization failed.\r\n"
             L"GOP not available. Falling back to text mode.\r\n");
+        systab->ConOut->OutputString(systab->ConOut,
+            L"Graphics init failed.\r\n");
         /* Could launch text-mode version here */
         systab->ConOut->OutputString(systab->ConOut,
             L"Press any key to continue...\r\n");
@@ -1645,9 +1686,31 @@ efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *systab)
     build_tiles();
 
     /* Main event loop */
+    BOOLEAN need_render = TRUE; /* first frame always renders */
     for (;;) {
-        /* Poll mouse */
+        /* Poll mouse — save previous position to detect movement */
+        INT32 prev_mx = gMouse.x, prev_my = gMouse.y;
         mouse_poll();
+        BOOLEAN mouse_moved = (gMouse.x != prev_mx || gMouse.y != prev_my);
+        if (gMouse.left_click || gMouse.right_click)
+            need_render = TRUE;
+
+        /* Check hover changes when mouse moved (avoid full redraw for cursor-only) */
+        BOOLEAN hover_changed = FALSE;
+        if (mouse_moved && !need_render) {
+            for (UINTN i = 0; i < gTileCount; i++) {
+                BOOLEAN h = mouse_in_rect(&gTiles[i].bounds);
+                if (h != gTiles[i].hover) { hover_changed = TRUE; break; }
+            }
+            if (!hover_changed) {
+                for (int b = 0; b < NUM_BUTTONS; b++) {
+                    BOOLEAN h = mouse_in_rect(&gToolbar[b].bounds);
+                    if (h != gToolbar[b].hover) { hover_changed = TRUE; break; }
+                }
+            }
+            if (hover_changed)
+                need_render = TRUE;
+        }
 
         /* Handle tile clicks */
         for (UINTN i = 0; i < gTileCount; i++) {
@@ -1662,6 +1725,7 @@ efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *systab)
                     gSelectedTile = (INT32)i;
                     set_status(gTiles[i].label);
                 }
+                need_render = TRUE;
             }
             if (mouse_rclicked_rect(&gTiles[i].bounds)) {
                 /* Right-click: change icon (legacy only) */
@@ -1670,6 +1734,7 @@ efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *systab)
                     change_icon(gTiles[i].snap_index);
                     build_tiles();
                 }
+                need_render = TRUE;
             }
         }
 
@@ -1678,6 +1743,7 @@ efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *systab)
             if (mouse_clicked_rect(&gToolbar[b].bounds)) {
                 handle_button(gToolbar[b].id);
                 build_tiles(); /* Refresh */
+                need_render = TRUE;
             }
         }
 
@@ -1685,6 +1751,7 @@ efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *systab)
         EFI_INPUT_KEY key;
         status = gST->ConIn->ReadKeyStroke(gST->ConIn, &key);
         if (!EFI_ERROR(status)) {
+            need_render = TRUE;
             switch (key.UnicodeChar) {
                 case L'b': case L'B': /* Boot */
                 case L'\r':
@@ -1739,12 +1806,21 @@ efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *systab)
             if (key.ScanCode == 0x0F) handle_button(BTN_RESCAN);
         }
 
-        /* Render */
-        render_frame();
-        gfx_flip();
+        /* Render only when something changed */
+        if (need_render) {
+            mouse_restore_under();
+            render_frame();
+            gfx_flip();
+            mouse_save_under();
+            mouse_draw();
+            gfx_flip_rect(gMouse.x, gMouse.y, CURSOR_SPRITE_W, CURSOR_SPRITE_H);
+            need_render = FALSE;
+        } else if (mouse_moved) {
+            mouse_update_cursor();
+        }
 
-        /* Small delay to avoid spinning CPU */
-        gBS->Stall(16000); /* ~60 FPS */
+        /* Small delay to avoid spinning CPU while keeping cursor updates smooth. */
+        gBS->Stall(2000);
     }
 
     gfx_shutdown();

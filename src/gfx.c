@@ -38,6 +38,36 @@ static EFI_BOOT_SERVICES               *gBS_gfx;
 static EFI_SYSTEM_TABLE                 *gST_gfx;
 static EFI_SIMPLE_POINTER_PROTOCOL     *gPointer = NULL;
 static COLOR                           *cursor_save = NULL; /* Under-cursor backup */
+static INT32                            cursor_save_x = 0, cursor_save_y = 0;
+static BOOLEAN                          cursor_saved = FALSE;
+
+/* Cached background gradient — computed once, blitted each frame. */
+static COLOR                           *bg_cache = NULL;
+static BOOLEAN                          bg_cache_valid = FALSE;
+
+/* Dirty row tracking — only flip rows that were actually drawn. */
+static INT32                            dirty_y0, dirty_y1;
+static INT32                            prev_dirty_y0, prev_dirty_y1;
+
+static inline void mark_dirty(INT32 y0, INT32 y1) {
+    if (y0 < 0) y0 = 0;
+    if (y1 > (INT32)gGfx.screen_h) y1 = (INT32)gGfx.screen_h;
+    if (y0 < dirty_y0) dirty_y0 = y0;
+    if (y1 > dirty_y1) dirty_y1 = y1;
+}
+
+/* Fast 32-bit fill: writes two pixels at a time using 64-bit stores. */
+static inline void
+fill_row(COLOR *dst, UINT32 count, COLOR c)
+{
+    UINT64 pair = ((UINT64)c << 32) | (UINT64)c;
+    UINT64 *d64 = (UINT64 *)dst;
+    UINT32 pairs = count >> 1;
+    for (UINT32 i = 0; i < pairs; i++)
+        d64[i] = pair;
+    if (count & 1)
+        dst[count - 1] = c;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Initialization                                                     */
@@ -54,57 +84,60 @@ gfx_init(EFI_SYSTEM_TABLE *st, EFI_BOOT_SERVICES *bs)
     gBS_gfx = bs;
     gST_gfx = st;
 
-    /* Locate GOP */
-    status = bs->LocateHandleBuffer(
-        ByProtocol, &gEfiGraphicsOutputProtocolGuid,
-        NULL, &siz, &handles
-    );
-    if (EFI_ERROR(status) || siz == 0) return EFI_NOT_FOUND;
+    /* Prefer GOP bound to the active console output. Some firmware exposes
+       multiple GOP handles and index 0 may not be the visible display. */
+    status = bs->HandleProtocol(st->ConsoleOutHandle,
+                                &gEfiGraphicsOutputProtocolGuid,
+                                (void **)&gop);
 
-    status = bs->HandleProtocol(handles[0], &gEfiGraphicsOutputProtocolGuid, (void **)&gop);
-    if (handles) bs->FreePool(handles);
-    if (EFI_ERROR(status)) return status;
+    if (EFI_ERROR(status)) {
+        status = bs->LocateHandleBuffer(
+            ByProtocol, &gEfiGraphicsOutputProtocolGuid,
+            NULL, &siz, &handles
+        );
+        if (EFI_ERROR(status) || siz == 0) return EFI_NOT_FOUND;
+
+        gop = NULL;
+        for (UINTN i = 0; i < siz; i++) {
+            status = bs->HandleProtocol(handles[i],
+                                        &gEfiGraphicsOutputProtocolGuid,
+                                        (void **)&gop);
+            if (!EFI_ERROR(status) && gop) break;
+        }
+        if (handles) bs->FreePool(handles);
+        if (EFI_ERROR(status) || !gop) return EFI_NOT_FOUND;
+    }
 
     gGfx.gop = gop;
 
-    /* Find best resolution mode (prefer 1920x1080, fallback to highest) */
-    UINT32 best_mode = gop->Mode->Mode;
-    UINT32 best_w = 0, best_h = 0;
-    UINT32 preferred_mode = (UINT32)-1;
+    /* Keep the firmware-selected mode for maximum compatibility.
+       Mode switching causes black screens on some UEFI implementations. */
 
-    for (UINT32 m = 0; m < gop->Mode->MaxMode; m++) {
-        EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info;
-        UINTN info_size;
-        status = gop->QueryMode(gop, m, &info_size, &info);
-        if (EFI_ERROR(status)) continue;
-
-        if (info->HorizontalResolution == 1920 && info->VerticalResolution == 1080) {
-            preferred_mode = m;
-        }
-        if (info->HorizontalResolution * info->VerticalResolution > best_w * best_h) {
-            best_w = info->HorizontalResolution;
-            best_h = info->VerticalResolution;
-            best_mode = m;
-        }
-    }
-
-    if (preferred_mode != (UINT32)-1)
-        best_mode = preferred_mode;
-
-    /* Set mode */
-    if (best_mode != gop->Mode->Mode) {
-        gop->SetMode(gop, best_mode);
+    if (gop->Mode->Info->PixelFormat == PixelBltOnly) {
+        return EFI_UNSUPPORTED;
     }
 
     gGfx.screen_w = gop->Mode->Info->HorizontalResolution;
     gGfx.screen_h = gop->Mode->Info->VerticalResolution;
     gGfx.stride   = gop->Mode->Info->PixelsPerScanLine;
+    gGfx.fb_size  = gop->Mode->FrameBufferSize;
     gGfx.screen   = (COLOR *)(UINTN)gop->Mode->FrameBufferBase;
 
     /* Allocate back buffer */
     UINTN fb_size = gGfx.stride * gGfx.screen_h * sizeof(COLOR);
     status = bs->AllocatePool(EfiLoaderData, fb_size, (void **)&gGfx.framebuf);
     if (EFI_ERROR(status)) return status;
+
+    /* Allocate background gradient cache */
+    status = bs->AllocatePool(EfiLoaderData, fb_size, (void **)&bg_cache);
+    if (EFI_ERROR(status)) return status;
+    bg_cache_valid = FALSE;
+
+    /* Init dirty tracking to full-screen for first frame */
+    dirty_y0 = 0;
+    dirty_y1 = (INT32)gGfx.screen_h;
+    prev_dirty_y0 = 0;
+    prev_dirty_y1 = (INT32)gGfx.screen_h;
 
     /* Allocate cursor save area */
     status = bs->AllocatePool(EfiLoaderData,
@@ -133,6 +166,7 @@ void
 gfx_shutdown(void)
 {
     if (gGfx.framebuf) gBS_gfx->FreePool(gGfx.framebuf);
+    if (bg_cache)       gBS_gfx->FreePool(bg_cache);
     if (cursor_save)    gBS_gfx->FreePool(cursor_save);
 }
 
@@ -141,24 +175,107 @@ gfx_shutdown(void)
 /* ------------------------------------------------------------------ */
 
 void
+gfx_begin_frame(void)
+{
+    prev_dirty_y0 = dirty_y0;
+    prev_dirty_y1 = dirty_y1;
+    dirty_y0 = (INT32)gGfx.screen_h;
+    dirty_y1 = 0;
+}
+
+void
 gfx_clear(COLOR c)
 {
-    UINT32 total = gGfx.stride * gGfx.screen_h;
-    for (UINT32 i = 0; i < total; i++)
-        gGfx.framebuf[i] = c;
+    UINT32 stride = gGfx.stride;
+    UINT32 w = gGfx.screen_w;
+    for (UINT32 py = 0; py < gGfx.screen_h; py++) {
+        fill_row(&gGfx.framebuf[py * stride], w, c);
+    }
+    mark_dirty(0, (INT32)gGfx.screen_h);
+}
+
+void
+gfx_cache_bg(void)
+{
+    UINTN size = (UINTN)gGfx.stride * gGfx.screen_h * sizeof(COLOR);
+    CopyMem(bg_cache, gGfx.framebuf, size);
+    bg_cache_valid = TRUE;
+}
+
+void
+gfx_restore_bg(void)
+{
+    if (!bg_cache_valid) return;
+    /* Only restore rows that were drawn on last frame */
+    if (prev_dirty_y0 < prev_dirty_y1) {
+        INT32 y0 = prev_dirty_y0, y1 = prev_dirty_y1;
+        UINT32 stride = gGfx.stride;
+        UINTN row_bytes = (UINTN)gGfx.screen_w * sizeof(COLOR);
+        for (INT32 y = y0; y < y1; y++)
+            CopyMem(&gGfx.framebuf[y * stride], &bg_cache[y * stride], row_bytes);
+    }
 }
 
 void
 gfx_flip(void)
 {
+    /* Compute the union of previous and current dirty rows */
+    INT32 y0 = dirty_y0 < prev_dirty_y0 ? dirty_y0 : prev_dirty_y0;
+    INT32 y1 = dirty_y1 > prev_dirty_y1 ? dirty_y1 : prev_dirty_y1;
+    if (y0 >= y1) return; /* nothing to flip */
+    if (y0 < 0) y0 = 0;
+    if (y1 > (INT32)gGfx.screen_h) y1 = (INT32)gGfx.screen_h;
+
+    if (gGfx.screen && gGfx.fb_size > 0) {
+        /* Copy only dirty rows using 64-bit stores for MMIO throughput */
+        UINT32 stride = gGfx.stride;
+        for (INT32 y = y0; y < y1; y++) {
+            UINT64 *src = (UINT64 *)&gGfx.framebuf[y * stride];
+            UINT64 *dst = (UINT64 *)&gGfx.screen[y * stride];
+            UINT32 qwords = (gGfx.screen_w * sizeof(COLOR)) / 8;
+            for (UINT32 i = 0; i < qwords; i++)
+                dst[i] = src[i];
+        }
+        return;
+    }
+
+    /* Blt fallback — partial region */
     gGfx.gop->Blt(
         gGfx.gop,
-        (EFI_GRAPHICS_OUTPUT_BLT_PIXEL *)gGfx.framebuf,
+        (EFI_GRAPHICS_OUTPUT_BLT_PIXEL *)&gGfx.framebuf[y0 * gGfx.stride],
         EfiBltBufferToVideo,
-        0, 0, 0, 0,
-        gGfx.screen_w, gGfx.screen_h,
+        0, 0, 0, (UINTN)y0,
+        gGfx.screen_w, (UINTN)(y1 - y0),
         gGfx.stride * sizeof(COLOR)
     );
+}
+
+void
+gfx_flip_rect(INT32 x, INT32 y, UINT32 w, UINT32 h)
+{
+    /* Clip */
+    if (x < 0) { w = (INT32)w + x > 0 ? w + (UINT32)x : 0; x = 0; }
+    if (y < 0) { h = (INT32)h + y > 0 ? h + (UINT32)y : 0; y = 0; }
+    if (x + (INT32)w > (INT32)gGfx.screen_w) w = gGfx.screen_w - (UINT32)x;
+    if (y + (INT32)h > (INT32)gGfx.screen_h) h = gGfx.screen_h - (UINT32)y;
+    if ((INT32)w <= 0 || (INT32)h <= 0) return;
+
+    if (gGfx.screen && gGfx.fb_size > 0) {
+        UINT32 stride = gGfx.stride;
+        for (UINT32 row = 0; row < h; row++) {
+            UINT32 off = ((UINT32)y + row) * stride + (UINT32)x;
+            COLOR *src = &gGfx.framebuf[off];
+            COLOR *dst = &gGfx.screen[off];
+            for (UINT32 i = 0; i < w; i++)
+                dst[i] = src[i];
+        }
+    } else {
+        gGfx.gop->Blt(gGfx.gop,
+            (EFI_GRAPHICS_OUTPUT_BLT_PIXEL *)&gGfx.framebuf[y * gGfx.stride + x],
+            EfiBltBufferToVideo,
+            0, 0, (UINTN)x, (UINTN)y, w, h,
+            gGfx.stride * sizeof(COLOR));
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -171,6 +288,7 @@ put_pixel(INT32 x, INT32 y, COLOR c)
     if (x >= 0 && x < (INT32)gGfx.screen_w &&
         y >= 0 && y < (INT32)gGfx.screen_h) {
         gGfx.framebuf[y * gGfx.stride + x] = c;
+        mark_dirty(y, y + 1);
     }
 }
 
@@ -200,12 +318,13 @@ gfx_fill_rect(INT32 x, INT32 y, UINT32 w, UINT32 h, COLOR c)
     if (y1 < 0) y1 = 0;
     if (x2 > (INT32)gGfx.screen_w) x2 = (INT32)gGfx.screen_w;
     if (y2 > (INT32)gGfx.screen_h) y2 = (INT32)gGfx.screen_h;
+    if (x1 >= x2 || y1 >= y2) return;
 
+    UINT32 fill_w = (UINT32)(x2 - x1);
     for (INT32 py = y1; py < y2; py++) {
-        COLOR *row = &gGfx.framebuf[py * gGfx.stride];
-        for (INT32 px = x1; px < x2; px++)
-            row[px] = c;
+        fill_row(&gGfx.framebuf[py * gGfx.stride + x1], fill_w, c);
     }
+    mark_dirty(y1, y2);
 }
 
 void
@@ -238,10 +357,11 @@ gfx_vline(INT32 x, INT32 y, UINT32 h, COLOR c)
 COLOR
 gfx_blend(COLOR bg, COLOR fg, UINT8 alpha)
 {
+    /* Approximate /255 with >>8 after +128 bias for rounding. */
     UINT32 inv = 255 - alpha;
-    UINT32 r = (COLOR_R(fg) * alpha + COLOR_R(bg) * inv) / 255;
-    UINT32 g = (COLOR_G(fg) * alpha + COLOR_G(bg) * inv) / 255;
-    UINT32 b = (COLOR_B(fg) * alpha + COLOR_B(bg) * inv) / 255;
+    UINT32 r = (COLOR_R(fg) * alpha + COLOR_R(bg) * inv + 128) >> 8;
+    UINT32 g = (COLOR_G(fg) * alpha + COLOR_G(bg) * inv + 128) >> 8;
+    UINT32 b = (COLOR_B(fg) * alpha + COLOR_B(bg) * inv + 128) >> 8;
     return RGB(r, g, b);
 }
 
@@ -258,6 +378,7 @@ gfx_fill_rect_alpha(INT32 x, INT32 y, UINT32 w, UINT32 h, COLOR c, UINT8 alpha)
         for (INT32 px = x1; px < x2; px++)
             row[px] = gfx_blend(row[px], c, alpha);
     }
+    mark_dirty(y1, y2);
 }
 
 /* ------------------------------------------------------------------ */
@@ -267,11 +388,15 @@ gfx_fill_rect_alpha(INT32 x, INT32 y, UINT32 w, UINT32 h, COLOR c, UINT8 alpha)
 void
 gfx_gradient_v(INT32 x, INT32 y, UINT32 w, UINT32 h, COLOR top, COLOR bottom)
 {
+    UINT32 div = h > 1 ? h - 1 : 1;
     for (UINT32 row = 0; row < h; row++) {
-        UINT32 r = (COLOR_R(top) * (h - 1 - row) + COLOR_R(bottom) * row) / (h > 1 ? h - 1 : 1);
-        UINT32 g = (COLOR_G(top) * (h - 1 - row) + COLOR_G(bottom) * row) / (h > 1 ? h - 1 : 1);
-        UINT32 b = (COLOR_B(top) * (h - 1 - row) + COLOR_B(bottom) * row) / (h > 1 ? h - 1 : 1);
-        gfx_fill_rect(x, y + row, w, 1, RGB(r, g, b));
+        UINT32 inv = div - row;
+        COLOR c = RGB(
+            (COLOR_R(top) * inv + COLOR_R(bottom) * row) / div,
+            (COLOR_G(top) * inv + COLOR_G(bottom) * row) / div,
+            (COLOR_B(top) * inv + COLOR_B(bottom) * row) / div
+        );
+        gfx_fill_rect(x, y + (INT32)row, w, 1, c);
     }
 }
 
@@ -293,22 +418,32 @@ gfx_gradient_h(INT32 x, INT32 y, UINT32 w, UINT32 h, COLOR left, COLOR right)
 static void
 fill_circle_quarter(INT32 cx, INT32 cy, UINT32 r, UINT32 quarter, COLOR c)
 {
-    /* quarter: 0=TL, 1=TR, 2=BR, 3=BL */
+    /* Scanline-based: compute x-span for each y, then fill_row. */
     INT32 ri = (INT32)r;
+    INT32 r2 = ri * ri;
     for (INT32 dy = 0; dy <= ri; dy++) {
-        for (INT32 dx = 0; dx <= ri; dx++) {
-            if (dx * dx + dy * dy <= ri * ri) {
-                INT32 px, py;
-                switch (quarter) {
-                    case 0: px = cx - dx; py = cy - dy; break;
-                    case 1: px = cx + dx; py = cy - dy; break;
-                    case 2: px = cx + dx; py = cy + dy; break;
-                    case 3: px = cx - dx; py = cy + dy; break;
-                    default: return;
-                }
-                put_pixel(px, py, c);
-            }
+        /* Find max dx where dx*dx + dy*dy <= r*r */
+        INT32 max_dx = 0;
+        while ((max_dx + 1) * (max_dx + 1) + dy * dy <= r2)
+            max_dx++;
+
+        INT32 py, x0;
+        switch (quarter) {
+            case 0: py = cy - dy; x0 = cx - max_dx; break;
+            case 1: py = cy - dy; x0 = cx;          break;
+            case 2: py = cy + dy; x0 = cx;          break;
+            case 3: py = cy + dy; x0 = cx - max_dx; break;
+            default: return;
         }
+        UINT32 span = (UINT32)(max_dx + 1);
+        /* Clip and draw scanline */
+        if (py < 0 || py >= (INT32)gGfx.screen_h) continue;
+        if (x0 < 0) { span += (UINT32)x0; x0 = 0; }
+        if (x0 + (INT32)span > (INT32)gGfx.screen_w)
+            span = (UINT32)((INT32)gGfx.screen_w - x0);
+        if ((INT32)span <= 0) continue;
+        fill_row(&gGfx.framebuf[py * gGfx.stride + x0], span, c);
+        mark_dirty(py, py + 1);
     }
 }
 
@@ -354,11 +489,10 @@ gfx_rounded_rect(INT32 x, INT32 y, UINT32 w, UINT32 h, UINT32 r, COLOR c, UINT32
 void
 ui_draw_shadow(INT32 x, INT32 y, UINT32 w, UINT32 h, UINT32 spread)
 {
-    for (UINT32 s = 0; s < spread; s++) {
-        UINT8 alpha = (UINT8)(40 - (40 * s / spread));
-        gfx_fill_rect_alpha(x + s + 2, y + h + s, w, 1, COL_SHADOW, alpha);
-        gfx_fill_rect_alpha(x + w + s, y + s + 2, 1, h, COL_SHADOW, alpha);
-    }
+    /* Simple 2-step shadow: avoids per-pixel alpha blending. */
+    (void)spread;
+    gfx_fill_rect(x + 3, y + (INT32)h, w, 3, RGB(6, 6, 8));
+    gfx_fill_rect(x + (INT32)w, y + 3, 3, h, RGB(6, 6, 8));
 }
 
 /* ------------------------------------------------------------------ */
@@ -699,19 +833,37 @@ mouse_init(EFI_BOOT_SERVICES *bs)
         return EFI_NOT_FOUND;
     }
 
-    status = bs->HandleProtocol(
-        handles[0], &gEfiSimplePointerProtocolGuid,
-        (void **)&gPointer
-    );
+    gPointer = NULL;
+    UINTN best_score = 0;
+
+    for (UINTN i = 0; i < count; i++) {
+        EFI_SIMPLE_POINTER_PROTOCOL *ptr = NULL;
+        status = bs->HandleProtocol(
+            handles[i], &gEfiSimplePointerProtocolGuid,
+            (void **)&ptr
+        );
+        if (EFI_ERROR(status) || !ptr || !ptr->Mode) continue;
+
+        /* Prefer higher-resolution devices, but still accept unknown (0/0). */
+        UINTN score = (UINTN)ptr->Mode->ResolutionX + (UINTN)ptr->Mode->ResolutionY;
+        if (!gPointer || score > best_score) {
+            gPointer = ptr;
+            best_score = score;
+        }
+    }
     if (handles) bs->FreePool(handles);
 
+    if (!gPointer) {
+        gMouse.visible = FALSE;
+        return EFI_NOT_FOUND;
+    }
+
+    /* Reset pointer */
+    status = gPointer->Reset(gPointer, TRUE);
     if (EFI_ERROR(status)) {
         gMouse.visible = FALSE;
         return status;
     }
-
-    /* Reset pointer */
-    gPointer->Reset(gPointer, TRUE);
     return EFI_SUCCESS;
 }
 
@@ -721,49 +873,124 @@ mouse_poll(void)
     if (!gPointer) return;
 
     EFI_SIMPLE_POINTER_STATE state;
-    EFI_STATUS status = gPointer->GetState(gPointer, &state);
+    EFI_STATUS status;
+    INT64 dx_counts = 0;
+    INT64 dy_counts = 0;
+    BOOLEAN saw_state = FALSE;
 
     /* Save previous click state */
     BOOLEAN prev_left = gMouse.left_pressed;
     BOOLEAN prev_right = gMouse.right_pressed;
 
-    if (!EFI_ERROR(status)) {
-        /* Accumulate sub-pixel movement to avoid integer truncation */
+    /* Drain all queued pointer updates so motion stays fluid. */
+    for (;;) {
+        status = gPointer->GetState(gPointer, &state);
+        if (EFI_ERROR(status)) break;
+        saw_state = TRUE;
+        dx_counts += state.RelativeMovementX;
+        dy_counts += state.RelativeMovementY;
+        gMouse.left_pressed = state.LeftButton;
+        gMouse.right_pressed = state.RightButton;
+    }
+
+    if (saw_state) {
+        /* Accumulate sub-pixel movement to avoid integer truncation. */
         static INT64 acc_x = 0, acc_y = 0;
+        const INT64 max_step_px = 48;
 
-        acc_x += state.RelativeMovementX;
-        acc_y += state.RelativeMovementY;
+        acc_x += dx_counts;
+        acc_y += dy_counts;
 
-        /* Resolution is counts per mm.  Convert to pixels (~8 px/mm). */
-        #define MOUSE_SPEED 8
-        INT64 res_x = gPointer->Mode->ResolutionX > 0
-                     ? (INT64)gPointer->Mode->ResolutionX : 1000;
-        INT64 res_y = gPointer->Mode->ResolutionY > 0
-                     ? (INT64)gPointer->Mode->ResolutionY : 1000;
+        INT64 px = 0;
+        INT64 py = 0;
 
-        INT32 px = (INT32)(acc_x * MOUSE_SPEED / res_x);
-        INT32 py = (INT32)(acc_y * MOUSE_SPEED / res_y);
+        /* If firmware provides counts/mm, map to pixels/mm.
+           If not, treat counts as raw deltas to avoid coarse jumps. */
+        if (gPointer->Mode->ResolutionX > 0 || gPointer->Mode->ResolutionY > 0) {
+            const INT64 target_px_per_mm = 8;
 
-        /* Subtract consumed counts, keep remainder for next poll */
-        acc_x -= (INT64)px * res_x / MOUSE_SPEED;
-        acc_y -= (INT64)py * res_y / MOUSE_SPEED;
+            if (gPointer->Mode->ResolutionX > 0) {
+                INT64 res_x = (INT64)gPointer->Mode->ResolutionX;
+                px = (acc_x * target_px_per_mm) / res_x;
+                acc_x -= (px * res_x) / target_px_per_mm;
+            } else {
+                px = acc_x;
+                acc_x = 0;
+            }
 
-        gMouse.x += px;
-        gMouse.y += py;
+            if (gPointer->Mode->ResolutionY > 0) {
+                INT64 res_y = (INT64)gPointer->Mode->ResolutionY;
+                py = (acc_y * target_px_per_mm) / res_y;
+                acc_y -= (py * res_y) / target_px_per_mm;
+            } else {
+                py = acc_y;
+                acc_y = 0;
+            }
+        } else {
+            /* Unknown resolution is common in UEFI. 1:1 feels smoother than
+               dividing by an arbitrary large constant. */
+            px = acc_x;
+            py = acc_y;
+            acc_x = 0;
+            acc_y = 0;
+        }
+
+        /* Clamp per-frame jump and keep remainder in accumulator for smoothness. */
+        if (px > max_step_px) {
+            acc_x += (px - max_step_px);
+            px = max_step_px;
+        } else if (px < -max_step_px) {
+            acc_x += (px + max_step_px);
+            px = -max_step_px;
+        }
+
+        if (py > max_step_px) {
+            acc_y += (py - max_step_px);
+            py = max_step_px;
+        } else if (py < -max_step_px) {
+            acc_y += (py + max_step_px);
+            py = -max_step_px;
+        }
+
+        gMouse.x += (INT32)px;
+        gMouse.y += (INT32)py;
 
         /* Clamp to screen */
         if (gMouse.x < 0) gMouse.x = 0;
         if (gMouse.y < 0) gMouse.y = 0;
         if (gMouse.x >= (INT32)gGfx.screen_w) gMouse.x = (INT32)gGfx.screen_w - 1;
         if (gMouse.y >= (INT32)gGfx.screen_h) gMouse.y = (INT32)gGfx.screen_h - 1;
-
-        gMouse.left_pressed = state.LeftButton;
-        gMouse.right_pressed = state.RightButton;
     }
 
     /* Detect click (press→release) */
     gMouse.left_click = (prev_left && !gMouse.left_pressed);
     gMouse.right_click = (prev_right && !gMouse.right_pressed);
+}
+
+void
+mouse_save_under(void)
+{
+    if (!cursor_save || !gMouse.visible) return;
+    cursor_save_x = gMouse.x;
+    cursor_save_y = gMouse.y;
+    for (INT32 cy = 0; cy < CURSOR_SPRITE_H; cy++)
+        for (INT32 cx = 0; cx < CURSOR_SPRITE_W; cx++)
+            cursor_save[cy * CURSOR_SPRITE_W + cx] = get_pixel(cursor_save_x + cx, cursor_save_y + cy);
+    cursor_saved = TRUE;
+}
+
+void
+mouse_restore_under(void)
+{
+    if (!cursor_saved || !cursor_save) return;
+    for (INT32 cy = 0; cy < CURSOR_SPRITE_H; cy++)
+        for (INT32 cx = 0; cx < CURSOR_SPRITE_W; cx++) {
+            INT32 px = cursor_save_x + cx, py = cursor_save_y + cy;
+            if (px >= 0 && px < (INT32)gGfx.screen_w &&
+                py >= 0 && py < (INT32)gGfx.screen_h)
+                gGfx.framebuf[py * gGfx.stride + px] = cursor_save[cy * CURSOR_SPRITE_W + cx];
+        }
+    cursor_saved = FALSE;
 }
 
 void
@@ -779,6 +1006,19 @@ mouse_draw(void)
             put_pixel(gMouse.x + cx, gMouse.y + cy, c);
         }
     }
+}
+
+void
+mouse_update_cursor(void)
+{
+    if (!gMouse.visible) return;
+    /* Erase old cursor from framebuf, push to screen */
+    mouse_restore_under();
+    gfx_flip_rect(cursor_save_x, cursor_save_y, CURSOR_SPRITE_W, CURSOR_SPRITE_H);
+    /* Draw new cursor */
+    mouse_save_under();
+    mouse_draw();
+    gfx_flip_rect(gMouse.x, gMouse.y, CURSOR_SPRITE_W, CURSOR_SPRITE_H);
 }
 
 BOOLEAN
