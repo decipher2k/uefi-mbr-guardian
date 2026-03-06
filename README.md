@@ -185,3 +185,7 @@ sudo cp icons/*.bmp /boot/efi/EFI/mbr-guardian/icons/
 - BMP icons must be uncompressed (no RLE, no PNG).
 - No Secure Boot without custom signing.
 - Legacy boot handoff is firmware-dependent; tested with AMI/Phoenix/Insyde.
+
+## License
+
+MIT License

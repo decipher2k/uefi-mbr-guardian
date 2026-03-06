@@ -260,6 +260,7 @@ enumerate_disks(void)
         if (EFI_ERROR(status)) continue;
         if (bio->Media->LogicalPartition) continue;
         if (bio->Media->BlockSize == 0) continue;
+        if (!bio->Media->MediaPresent) continue;
 
         gDisks[gDiskCount].block_io = bio;
         gDisks[gDiskCount].handle   = handles[i];
@@ -275,14 +276,48 @@ static EFI_STATUS read_mbr(UINTN idx, UINT8 *buf)
 {
     if (idx >= gDiskCount) return EFI_INVALID_PARAMETER;
     EFI_BLOCK_IO_PROTOCOL *b = gDisks[idx].block_io;
-    return b->ReadBlocks(b, b->Media->MediaId, 0, MBR_SIZE, buf);
+    UINT32 blksz = b->Media->BlockSize;
+
+    /* ReadBlocks requires BufferSize to be a multiple of BlockSize.
+       For 4K-sector drives, read a full block and extract the MBR. */
+    if (blksz <= MBR_SIZE) {
+        return b->ReadBlocks(b, b->Media->MediaId, 0, MBR_SIZE, buf);
+    }
+
+    UINT8 *tmp;
+    EFI_STATUS s = gBS->AllocatePool(EfiBootServicesData, blksz, (void **)&tmp);
+    if (EFI_ERROR(s)) return s;
+
+    s = b->ReadBlocks(b, b->Media->MediaId, 0, blksz, tmp);
+    if (!EFI_ERROR(s)) {
+        for (UINTN i = 0; i < MBR_SIZE; i++) buf[i] = tmp[i];
+    }
+    gBS->FreePool(tmp);
+    return s;
 }
 
 static EFI_STATUS write_mbr(UINTN idx, const UINT8 *buf)
 {
     if (idx >= gDiskCount) return EFI_INVALID_PARAMETER;
     EFI_BLOCK_IO_PROTOCOL *b = gDisks[idx].block_io;
-    return b->WriteBlocks(b, b->Media->MediaId, 0, MBR_SIZE, (void *)buf);
+    UINT32 blksz = b->Media->BlockSize;
+
+    if (blksz <= MBR_SIZE) {
+        return b->WriteBlocks(b, b->Media->MediaId, 0, MBR_SIZE, (void *)buf);
+    }
+
+    /* Read-modify-write: preserve bytes beyond the MBR in the first block */
+    UINT8 *tmp;
+    EFI_STATUS s = gBS->AllocatePool(EfiBootServicesData, blksz, (void **)&tmp);
+    if (EFI_ERROR(s)) return s;
+
+    s = b->ReadBlocks(b, b->Media->MediaId, 0, blksz, tmp);
+    if (!EFI_ERROR(s)) {
+        for (UINTN i = 0; i < MBR_SIZE; i++) tmp[i] = buf[i];
+        s = b->WriteBlocks(b, b->Media->MediaId, 0, blksz, tmp);
+    }
+    gBS->FreePool(tmp);
+    return s;
 }
 
 static BOOLEAN is_valid_mbr(const UINT8 *buf)
