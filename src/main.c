@@ -26,6 +26,8 @@ limitations under the License
 
 #include <efi.h>
 #include <efilib.h>
+#include <efidevp.h>
+#include <protocol/legacyboot.h>
 #include "gfx.h"
 #include "font8x16.h"
 
@@ -96,6 +98,90 @@ typedef struct {
 #define gImageHandle        LibImageHandle
 extern EFI_HANDLE           LibImageHandle;
 
+/* PI-spec EFI_LEGACY_BIOS_PROTOCOL (modern CSM firmware uses this GUID
+   instead of the old Intel LEGACY_BOOT_PROTOCOL). */
+static EFI_GUID gEfiLegacyBiosProtocolGuid =
+    { 0xdb9a1e3d, 0x45cb, 0x4abb,
+      { 0x85, 0x3b, 0xe5, 0x38, 0x7f, 0xdb, 0x2e, 0x2d } };
+
+typedef EFI_STATUS (EFIAPI *PI_LEGACY_BIOS_BOOT)(
+    IN void                 *This,
+    IN BBS_BBS_DEVICE_PATH  *BootOption,
+    IN UINT32                LoadOptionsSize,
+    IN void                 *LoadOptions
+);
+
+typedef EFI_STATUS (EFIAPI *PI_LEGACY_BIOS_INT86)(
+    IN void     *This,
+    IN UINT8     BiosInt,
+    IN OUT void *Regs
+);
+
+typedef EFI_STATUS (EFIAPI *PI_LEGACY_BIOS_GET_BBS_INFO)(
+    IN  void     *This,
+    OUT UINT16   *HddCount,
+    OUT void    **HddInfo,
+    OUT UINT16   *BbsCount,
+    OUT void    **BbsTable
+);
+
+typedef EFI_STATUS (EFIAPI *PI_LEGACY_BIOS_PREPARE_TO_BOOT)(
+    IN  void     *This,
+    OUT UINT16   *BbsCount,
+    OUT void    **BbsTable
+);
+
+typedef struct {
+    PI_LEGACY_BIOS_INT86          Int86;                  /* 0 */
+    void                         *FarCall86;              /* 1 */
+    void                         *CheckPciRom;            /* 2 */
+    void                         *InstallPciRom;          /* 3 */
+    PI_LEGACY_BIOS_BOOT           LegacyBoot;             /* 4 */
+    void                         *UpdateKeyboardLedStatus;/* 5 */
+    PI_LEGACY_BIOS_GET_BBS_INFO   GetBbsInfo;             /* 6 */
+    void                         *ShadowAllLegacyOproms;  /* 7 */
+    PI_LEGACY_BIOS_PREPARE_TO_BOOT PrepareToBootEfi;      /* 8 */
+} PI_LEGACY_BIOS_PROTOCOL;
+
+/* PI BBS table entry (packed per PI spec Vol 5, Appendix A).
+   Total size = 67 bytes (0x00..0x42). */
+#pragma pack(1)
+typedef struct {
+    UINT16  BootPriority;       /* 0x00 */
+    UINT32  Bus;                /* 0x02 */
+    UINT32  Device;             /* 0x06 */
+    UINT32  Function;           /* 0x0A */
+    UINT8   Class;              /* 0x0E */
+    UINT8   SubClass;           /* 0x0F */
+    UINT16  MfgStringOffset;    /* 0x10 */
+    UINT16  MfgStringSegment;   /* 0x12 */
+    UINT16  DeviceType;         /* 0x14 */
+    UINT16  StatusFlags;        /* 0x16 */
+    UINT16  BootHandlerOffset;  /* 0x18 */
+    UINT16  BootHandlerSegment; /* 0x1A */
+    UINT16  DescStringOffset;   /* 0x1C */
+    UINT16  DescStringSegment;  /* 0x1E */
+    UINT32  InitPerReserved;    /* 0x20 */
+    UINT16  AdditionalIrq13;    /* 0x24..0x2D */
+    UINT8   _pad1[8];
+    UINT16  AdditionalIrq18;    /* 0x2E..0x37 */
+    UINT8   _pad2[8];
+    UINT16  AdditionalIrq19;    /* 0x38..0x41 */
+    UINT8   _pad3[8];
+    UINT8   IBV1;               /* 0x42 */
+} PI_BBS_ENTRY;                 /* 67 bytes */
+#pragma pack()
+#define PI_BBS_IGNORE   0xFFFF
+#define PI_BBS_LOW_PRIO 0xFFFE
+
+/* Minimal register set for PI Int86 (x86 registers, zeroed for INT 19h) */
+typedef struct {
+    UINT32  EAX, EBX, ECX, EDX, ESI, EDI;
+    UINT16  EFlags;
+    UINT16  ES, CS, SS, DS, FS, GS;
+    UINT32  EBP, ESP;
+} PI_IA32_REGISTER_SET;
+
 static DISK_ENTRY           gDisks[MAX_DISKS];
 static UINTN                gDiskCount = 0;
 
@@ -116,6 +202,8 @@ static CHAR16               gStatusMsg[128] = L"Ready";
 static EFI_GUID             gMbrgDebugGuid =
     { 0x5f0a6f09, 0x7bf0, 0x4b3d, { 0x92, 0x06, 0xbd, 0xc7, 0xca, 0x57, 0xf8, 0xc1 } };
 
+#define MBRG_SKIP_VAR       L"MBRGSkipOnce"
+
 static void
 mark_boot_seen(void)
 {
@@ -131,6 +219,37 @@ mark_boot_seen(void)
         L"MBRGSeen", &gMbrgDebugGuid,
         EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS,
         sizeof(count), &count);
+}
+
+static void
+set_skip_once(BOOLEAN enabled)
+{
+    UINT8 v = enabled ? 1 : 0;
+    if (!enabled) {
+        /* Delete variable */
+        gRS->SetVariable(MBRG_SKIP_VAR, &gMbrgDebugGuid, 0, 0, NULL);
+        return;
+    }
+
+    gRS->SetVariable(
+        MBRG_SKIP_VAR, &gMbrgDebugGuid,
+        EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS,
+        sizeof(v), &v);
+}
+
+static BOOLEAN
+consume_skip_once(void)
+{
+    UINT8 v = 0;
+    UINT32 attrs;
+    UINTN size = sizeof(v);
+    EFI_STATUS s = gRS->GetVariable(MBRG_SKIP_VAR, &gMbrgDebugGuid, &attrs, &size, &v);
+    if (EFI_ERROR(s) || size != sizeof(v) || v == 0)
+        return FALSE;
+
+    /* One-shot: clear now and signal caller to passthrough. */
+    set_skip_once(FALSE);
+    return TRUE;
 }
 
 /* ------------------------------------------------------------------ */
@@ -152,6 +271,10 @@ enum {
 #define NUM_BUTTONS 9
 
 static BUTTON gToolbar[NUM_BUTTONS];
+
+/* Forward declarations for internal helpers used across sections. */
+static EFI_STATUS read_mbr(UINTN idx, UINT8 *buf);
+static BOOLEAN is_valid_mbr(const UINT8 *buf);
 
 /* ------------------------------------------------------------------ */
 /*  Utility                                                            */
@@ -190,6 +313,258 @@ wstrlen(const CHAR16 *s)
     UINTN n = 0;
     while (s[n]) n++;
     return n;
+}
+
+static CHAR16
+to_lower_ascii(CHAR16 c)
+{
+    if (c >= L'A' && c <= L'Z') return (CHAR16)(c - L'A' + L'a');
+    return c;
+}
+
+static BOOLEAN
+wcontains_ci(const CHAR16 *hay, const CHAR16 *needle)
+{
+    if (!hay || !needle || !needle[0]) return FALSE;
+    for (UINTN i = 0; hay[i]; i++) {
+        UINTN j = 0;
+        while (needle[j] && hay[i + j] &&
+               to_lower_ascii(hay[i + j]) == to_lower_ascii(needle[j])) {
+            j++;
+        }
+        if (!needle[j]) return TRUE;
+    }
+    return FALSE;
+}
+
+static EFI_STATUS
+read_boot_option_desc(UINT16 boot_num, CHAR16 *desc_out, UINTN out_max,
+                      BOOLEAN *active, BOOLEAN *is_bbs, BOOLEAN *has_efi_file)
+{
+    CHAR16 var_name[16];
+    const CHAR16 *hex = L"0123456789ABCDEF";
+    UINT8 *var_data = NULL;
+    UINTN var_size = 0;
+    EFI_STATUS status;
+
+    var_name[0] = L'B'; var_name[1] = L'o';
+    var_name[2] = L'o'; var_name[3] = L't';
+    var_name[4] = hex[(boot_num >> 12) & 0xF];
+    var_name[5] = hex[(boot_num >> 8) & 0xF];
+    var_name[6] = hex[(boot_num >> 4) & 0xF];
+    var_name[7] = hex[boot_num & 0xF];
+    var_name[8] = L'\0';
+
+    status = gRS->GetVariable(var_name, &gEfiGlobalVariableGuid, NULL, &var_size, NULL);
+    if (status != EFI_BUFFER_TOO_SMALL || var_size < 8)
+        return EFI_NOT_FOUND;
+
+    status = gBS->AllocatePool(EfiBootServicesData, var_size, (void **)&var_data);
+    if (EFI_ERROR(status)) return status;
+
+    status = gRS->GetVariable(var_name, &gEfiGlobalVariableGuid, NULL, &var_size, var_data);
+    if (EFI_ERROR(status)) {
+        gBS->FreePool(var_data);
+        return status;
+    }
+
+    UINT32 attrs = *(UINT32 *)var_data;
+    CHAR16 *desc = (CHAR16 *)(var_data + 6);
+
+    if (active) *active = (attrs & 1) ? TRUE : FALSE;
+    if (is_bbs) *is_bbs = FALSE;
+    if (has_efi_file) *has_efi_file = FALSE;
+
+    UINTN i = 0;
+    while (desc[i] && i < out_max - 1) {
+        desc_out[i] = desc[i];
+        i++;
+    }
+    desc_out[i] = L'\0';
+
+    /* Boot option layout: attrs(4), fp_len(2), desc(UTF-16 NUL), device path list */
+    if (var_size >= 8) {
+        UINT16 fp_len = *(UINT16 *)(var_data + 4);
+        UINT8 *p = (UINT8 *)(var_data + 6);
+        UINT8 *end = var_data + var_size;
+
+        /* Advance over UTF-16 description including terminator. */
+        while (p + sizeof(CHAR16) <= end) {
+            if (*(CHAR16 *)p == 0) {
+                p += sizeof(CHAR16);
+                break;
+            }
+            p += sizeof(CHAR16);
+        }
+
+        if (p <= end && fp_len > 0 && (UINTN)(end - p) >= fp_len) {
+            EFI_DEVICE_PATH_PROTOCOL *dp = (EFI_DEVICE_PATH_PROTOCOL *)p;
+            UINTN rem = fp_len;
+
+            while (rem >= sizeof(EFI_DEVICE_PATH_PROTOCOL)) {
+                UINTN node_len = (UINTN)dp->Length[0] | ((UINTN)dp->Length[1] << 8);
+                if (node_len < sizeof(EFI_DEVICE_PATH_PROTOCOL) || node_len > rem) break;
+
+                if (dp->Type == BBS_DEVICE_PATH) {
+                    if (is_bbs) *is_bbs = TRUE;
+                }
+                if (dp->Type == MEDIA_DEVICE_PATH && dp->SubType == MEDIA_FILEPATH_DP) {
+                    if (has_efi_file) *has_efi_file = TRUE;
+                }
+                if (dp->Type == END_DEVICE_PATH_TYPE &&
+                    dp->SubType == END_ENTIRE_DEVICE_PATH_SUBTYPE) {
+                    break;
+                }
+
+                rem -= node_len;
+                dp = (EFI_DEVICE_PATH_PROTOCOL *)((UINT8 *)dp + node_len);
+            }
+        }
+    }
+
+    gBS->FreePool(var_data);
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS
+find_legacy_bootnext(UINTN disk_idx, UINT16 *boot_num_out, CHAR16 *desc_out, UINTN desc_max)
+{
+    UINTN data_size = 0;
+    UINT8 *data = NULL;
+    EFI_STATUS status;
+    INTN best_score = -10000;
+    UINT16 best_num = 0;
+    CHAR16 best_desc[LABEL_MAX] = L"";
+    BOOLEAN prefer_usb = FALSE;
+    UINT16 boot_current = 0xFFFF;
+    UINTN boot_current_size = sizeof(boot_current);
+
+    if (disk_idx < gDiskCount) {
+        prefer_usb = gDisks[disk_idx].block_io->Media->RemovableMedia ? TRUE : FALSE;
+    }
+
+    gRS->GetVariable(L"BootCurrent", &gEfiGlobalVariableGuid, NULL,
+                     &boot_current_size, &boot_current);
+
+    status = gRS->GetVariable(L"BootOrder", &gEfiGlobalVariableGuid, NULL, &data_size, NULL);
+    if (status != EFI_BUFFER_TOO_SMALL || data_size == 0)
+        return EFI_NOT_FOUND;
+
+    status = gBS->AllocatePool(EfiBootServicesData, data_size, (void **)&data);
+    if (EFI_ERROR(status)) return status;
+
+    status = gRS->GetVariable(L"BootOrder", &gEfiGlobalVariableGuid, NULL, &data_size, data);
+    if (EFI_ERROR(status)) {
+        gBS->FreePool(data);
+        return status;
+    }
+
+    UINT16 *order = (UINT16 *)data;
+    UINTN count = data_size / sizeof(UINT16);
+
+    for (UINTN i = 0; i < count; i++) {
+        CHAR16 desc[LABEL_MAX];
+        BOOLEAN active = FALSE;
+        BOOLEAN is_bbs = FALSE;
+        BOOLEAN has_efi_file = FALSE;
+        INTN score = 0;
+
+        if (order[i] == boot_current) continue;
+
+        if (EFI_ERROR(read_boot_option_desc(order[i], desc, LABEL_MAX, &active,
+                                            &is_bbs, &has_efi_file))) continue;
+        if (!active) continue;
+
+        if (wcontains_ci(desc, L"mbr guardian")) continue;
+
+        /* For legacy fallback, only use explicit BBS/legacy-style options.
+           If firmware does not expose such options, fail in-app instead of
+           rebooting into arbitrary UEFI entries. */
+        if (!is_bbs) continue;
+        if (has_efi_file) continue;
+
+        if (is_bbs) score += 220;
+
+        if (wcontains_ci(desc, L"legacy") || wcontains_ci(desc, L"csm"))
+            score += 90;
+
+        if (wcontains_ci(desc, L"windows boot manager") ||
+            wcontains_ci(desc, L"ubuntu") ||
+            wcontains_ci(desc, L"grub") ||
+            wcontains_ci(desc, L"uefi")) {
+            score -= 200;
+        }
+
+        if (wcontains_ci(desc, L"lan") || wcontains_ci(desc, L"network") ||
+            wcontains_ci(desc, L"pxe")) {
+            score -= 80;
+        }
+
+        if (prefer_usb) {
+            if (wcontains_ci(desc, L"usb")) score += 120;
+            if (wcontains_ci(desc, L"hdd")) score += 30;
+            if (wcontains_ci(desc, L"cd")) score += 20;
+            if (wcontains_ci(desc, L"nvme") || wcontains_ci(desc, L"ata")) score -= 30;
+        } else {
+            if (wcontains_ci(desc, L"nvme")) score += 100;
+            if (wcontains_ci(desc, L"ata")) score += 80;
+            if (wcontains_ci(desc, L"hdd")) score += 50;
+            if (wcontains_ci(desc, L"usb")) score -= 20;
+        }
+
+        if (score > best_score) {
+            best_score = score;
+            best_num = order[i];
+            wstrcpy(best_desc, desc, LABEL_MAX);
+        }
+    }
+
+    /* Second pass: if no BBS entries matched, try non-BBS entries whose
+       description explicitly mentions "legacy" or "csm" and that have no
+       EFI file path (i.e. not a UEFI-native loader). */
+    if (best_score <= 0) {
+        for (UINTN i = 0; i < count; i++) {
+            CHAR16 desc[LABEL_MAX];
+            BOOLEAN active = FALSE;
+            BOOLEAN is_bbs = FALSE;
+            BOOLEAN has_efi_file = FALSE;
+            INTN score = 0;
+
+            if (order[i] == boot_current) continue;
+            if (EFI_ERROR(read_boot_option_desc(order[i], desc, LABEL_MAX,
+                                                &active, &is_bbs, &has_efi_file)))
+                continue;
+            if (!active) continue;
+            if (is_bbs) continue;            /* already tried */
+            if (has_efi_file) continue;       /* skip UEFI loaders */
+            if (wcontains_ci(desc, L"mbr guardian")) continue;
+
+            if (wcontains_ci(desc, L"legacy") || wcontains_ci(desc, L"csm"))
+                score += 100;
+            else
+                continue;   /* without explicit legacy/csm tag, skip */
+
+            if (wcontains_ci(desc, L"windows boot manager") ||
+                wcontains_ci(desc, L"ubuntu") ||
+                wcontains_ci(desc, L"grub") ||
+                wcontains_ci(desc, L"uefi"))
+                score -= 200;
+
+            if (score > best_score) {
+                best_score = score;
+                best_num = order[i];
+                wstrcpy(best_desc, desc, LABEL_MAX);
+            }
+        }
+    }
+
+    gBS->FreePool(data);
+
+    if (best_score <= 0) return EFI_NOT_FOUND;
+
+    *boot_num_out = best_num;
+    if (desc_out && desc_max > 0) wstrcpy(desc_out, best_desc, desc_max);
+    return EFI_SUCCESS;
 }
 
 /* ------------------------------------------------------------------ */
@@ -249,6 +624,50 @@ get_primary_partition_type(const UINT8 *mbr)
         }
     }
     return best_type;
+}
+
+static UINT32
+get_mbr_disk_signature(const UINT8 *mbr)
+{
+    return (UINT32)mbr[440] |
+           ((UINT32)mbr[441] << 8) |
+           ((UINT32)mbr[442] << 16) |
+           ((UINT32)mbr[443] << 24);
+}
+
+static UINTN
+resolve_snapshot_disk(const MBR_SNAPSHOT *snap)
+{
+    UINT32 sig = get_mbr_disk_signature(snap->mbr);
+
+    /* First try: matching MBR disk signature across currently visible disks. */
+    if (sig != 0) {
+        INT32 found = -1;
+        UINT8 cur[MBR_SIZE];
+
+        for (UINTN d = 0; d < gDiskCount; d++) {
+            if (EFI_ERROR(read_mbr(d, cur))) continue;
+            if (!is_valid_mbr(cur)) continue;
+            if (get_mbr_disk_signature(cur) == sig) {
+                if (found >= 0) {
+                    /* Ambiguous signature: keep deterministic fallback. */
+                    found = -2;
+                    break;
+                }
+                found = (INT32)d;
+            }
+        }
+
+        if (found >= 0)
+            return (UINTN)found;
+    }
+
+    /* Fallback to stored index when still valid. */
+    if (snap->disk_index < gDiskCount)
+        return (UINTN)snap->disk_index;
+
+    /* Last resort: first disk. */
+    return 0;
 }
 
 static COLOR
@@ -322,20 +741,26 @@ static EFI_STATUS write_mbr(UINTN idx, const UINT8 *buf)
     if (idx >= gDiskCount) return EFI_INVALID_PARAMETER;
     EFI_BLOCK_IO_PROTOCOL *b = gDisks[idx].block_io;
     UINT32 blksz = b->Media->BlockSize;
+    EFI_STATUS s;
 
     if (blksz <= MBR_SIZE) {
-        return b->WriteBlocks(b, b->Media->MediaId, 0, MBR_SIZE, (void *)buf);
+        s = b->WriteBlocks(b, b->Media->MediaId, 0, MBR_SIZE, (void *)buf);
+        if (EFI_ERROR(s)) return s;
+        /* Important for removable/USB media before immediate reboot/handoff. */
+        return b->FlushBlocks(b);
     }
 
     /* Read-modify-write: preserve bytes beyond the MBR in the first block */
     UINT8 *tmp;
-    EFI_STATUS s = gBS->AllocatePool(EfiBootServicesData, blksz, (void **)&tmp);
+    s = gBS->AllocatePool(EfiBootServicesData, blksz, (void **)&tmp);
     if (EFI_ERROR(s)) return s;
 
     s = b->ReadBlocks(b, b->Media->MediaId, 0, blksz, tmp);
     if (!EFI_ERROR(s)) {
         for (UINTN i = 0; i < MBR_SIZE; i++) tmp[i] = buf[i];
         s = b->WriteBlocks(b, b->Media->MediaId, 0, blksz, tmp);
+        if (!EFI_ERROR(s))
+            s = b->FlushBlocks(b);
     }
     gBS->FreePool(tmp);
     return s;
@@ -1373,7 +1798,9 @@ do_legacy_boot(UINTN snap_idx)
     if (snap_idx >= gSnaps.count) return;
     MBR_SNAPSHOT *snap = &gSnaps.entries[snap_idx];
 
-    if (snap->disk_index >= gDiskCount) {
+    UINTN target_disk = resolve_snapshot_disk(snap);
+
+    if (gDiskCount == 0 || target_disk >= gDiskCount) {
         ui_dialog_info(L"Error", L"Target disk not found!");
         return;
     }
@@ -1412,9 +1839,23 @@ do_legacy_boot(UINTN snap_idx)
 
         if (mouse_clicked_rect(&btn_boot.bounds)) {
             /* Restore MBR */
-            EFI_STATUS s = write_mbr(snap->disk_index, snap->mbr);
+            EFI_STATUS s = write_mbr(target_disk, snap->mbr);
             if (EFI_ERROR(s)) {
                 ui_dialog_info(L"Error", L"Failed to write MBR to disk!");
+                return;
+            }
+
+            /* Read back sector 0 to catch write/cache issues (common on USB). */
+            UINT8 verify[MBR_SIZE];
+            s = read_mbr(target_disk, verify);
+            if (EFI_ERROR(s)) {
+                ui_dialog_info(L"Error", L"MBR verify read failed after write.");
+                set_status(L"Legacy boot aborted: cannot verify written MBR.");
+                return;
+            }
+            if (mbr_hash(verify, MBR_SIZE) != mbr_hash(snap->mbr, MBR_SIZE)) {
+                ui_dialog_info(L"Error", L"Written MBR differs from snapshot!");
+                set_status(L"Legacy boot aborted: MBR write verification mismatch.");
                 return;
             }
 
@@ -1426,15 +1867,271 @@ do_legacy_boot(UINTN snap_idx)
                 L"Rebooting to legacy MBR on disk...", COL_TEXT_DIM, 1);
             gfx_flip();
 
-            /* Try legacy BIOS protocol */
-            EFI_GUID leg_guid = { 0xdb9a1e3d, 0x45cb, 0x4abb,
-                {0x85,0x3b,0xe5,0x38,0x7f,0xdb,0x2e,0x2d} };
-            void *leg = NULL;
-            gBS->LocateProtocol(&leg_guid, NULL, &leg);
+            /* Try true legacy handoff via LegacyBoot protocol when available. */
+            LEGACY_BOOT_INTERFACE *legacy = NULL;
+            EFI_STATUS ls = gBS->LocateProtocol(&LegacyBootProtocol, NULL, (void **)&legacy);
+            BOOLEAN have_legacy_protocol = (!EFI_ERROR(ls) && legacy && legacy->BootIt);
 
-            /* Warm reboot - the restored MBR will be booted by firmware */
-            gBS->Stall(1000000); /* 1 second delay */
-            gRS->ResetSystem(EfiResetWarm, EFI_SUCCESS, 0, NULL);
+            /* If firmware falls back to this app on reboot, skip once and let
+               firmware continue with next boot option instead of looping here. */
+            set_skip_once(TRUE);
+
+            if (have_legacy_protocol) {
+                /* Prefer the selected disk's device path for handoff. */
+                EFI_DEVICE_PATH *dp = NULL;
+                ls = gBS->HandleProtocol(gDisks[target_disk].handle,
+                                         &gEfiDevicePathProtocolGuid,
+                                         (void **)&dp);
+                if (!EFI_ERROR(ls) && dp) {
+                    ls = legacy->BootIt(dp);
+                    if (!EFI_ERROR(ls)) return;
+                }
+
+                /* Fallback: generic BBS device paths. USB is important for
+                   external drives/sticks that expose legacy boot via CSM. */
+                struct {
+                    BBS_BBS_DEVICE_PATH bbs;
+                    EFI_DEVICE_PATH_PROTOCOL end;
+                } bbs_hd;
+
+                bbs_hd.bbs.Header.Type = BBS_DEVICE_PATH;
+                bbs_hd.bbs.Header.SubType = BBS_BBS_DP;
+                bbs_hd.bbs.Header.Length[0] = sizeof(BBS_BBS_DEVICE_PATH);
+                bbs_hd.bbs.Header.Length[1] = 0;
+                bbs_hd.bbs.StatusFlag = 0;
+                bbs_hd.bbs.String[0] = '\0';
+
+                bbs_hd.end.Type = END_DEVICE_PATH_TYPE;
+                bbs_hd.end.SubType = END_ENTIRE_DEVICE_PATH_SUBTYPE;
+                bbs_hd.end.Length[0] = sizeof(EFI_DEVICE_PATH_PROTOCOL);
+                bbs_hd.end.Length[1] = 0;
+
+                UINT16 bbs_types[] = {
+                    BBS_TYPE_HARDDRIVE,
+                    BBS_TYPE_USB,
+                    BBS_TYPE_CDROM,
+                    BBS_TYPE_DEV,
+                    BBS_TYPE_UNKNOWN
+                };
+                for (UINTN i = 0; i < sizeof(bbs_types)/sizeof(bbs_types[0]); i++) {
+                    bbs_hd.bbs.DeviceType = bbs_types[i];
+                    ls = legacy->BootIt((EFI_DEVICE_PATH *)&bbs_hd);
+                    if (!EFI_ERROR(ls)) return;
+                }
+            }
+
+            /* Fallback: PI-spec EFI_LEGACY_BIOS_PROTOCOL (AMI/Phoenix/Insyde
+               CSM uses this GUID instead of the old Intel protocol). */
+            PI_LEGACY_BIOS_PROTOCOL *pi_csm = NULL;
+            BOOLEAN have_pi_csm = FALSE;
+            if (!have_legacy_protocol) {
+                EFI_STATUS pi_s = gBS->LocateProtocol(
+                    &gEfiLegacyBiosProtocolGuid, NULL, (void **)&pi_csm);
+                have_pi_csm = (!EFI_ERROR(pi_s) && pi_csm && pi_csm->LegacyBoot);
+            }
+            if (have_pi_csm) {
+                /* Step 1: enumerate BBS table and prioritize target device. */
+                UINT16 hdd_cnt = 0, bbs_cnt = 0;
+                void *hdd_info = NULL;
+                PI_BBS_ENTRY *bbs_tbl = NULL;
+                BOOLEAN prefer_usb_bbs = FALSE;
+                if (target_disk < gDiskCount)
+                    prefer_usb_bbs = gDisks[target_disk].block_io->Media->RemovableMedia ? TRUE : FALSE;
+
+                if (pi_csm->GetBbsInfo) {
+                    pi_csm->GetBbsInfo(pi_csm, &hdd_cnt, &hdd_info,
+                                       &bbs_cnt, (void **)&bbs_tbl);
+                }
+
+                /* Set BootPriority so the matching device type boots first. */
+                UINT16 want_type = prefer_usb_bbs ? BBS_TYPE_USB : BBS_TYPE_HARDDRIVE;
+                if (bbs_tbl && bbs_cnt > 0) {
+                    UINT16 next_prio = 1;
+                    for (UINT16 bi = 0; bi < bbs_cnt; bi++) {
+                        if (bbs_tbl[bi].BootPriority == PI_BBS_IGNORE) continue;
+                        if (bbs_tbl[bi].DeviceType == want_type)
+                            bbs_tbl[bi].BootPriority = 0;
+                        else
+                            bbs_tbl[bi].BootPriority = next_prio++;
+                    }
+                }
+
+                /* Step 2a: try handing off the target disk's own device path.
+                   Some firmware (AMI) accepts the block-IO handle's native
+                   device path for LegacyBoot instead of synthetic BBS nodes. */
+                if (target_disk < gDiskCount) {
+                    EFI_DEVICE_PATH *disk_dp = NULL;
+                    EFI_STATUS dp_s = gBS->HandleProtocol(
+                        gDisks[target_disk].handle,
+                        &gEfiDevicePathProtocolGuid, (void **)&disk_dp);
+                    if (!EFI_ERROR(dp_s) && disk_dp) {
+                        ls = pi_csm->LegacyBoot(pi_csm,
+                            (BBS_BBS_DEVICE_PATH *)disk_dp, 0, NULL);
+                        if (!EFI_ERROR(ls)) return;
+                    }
+                }
+
+                /* Step 2b: try BBS device path nodes for each plausible type.
+                   LegacyBoot internally calls PrepareToBoot (the legacy
+                   variant); do NOT call PrepareToBootEfi here — that one
+                   tears down CSM for EFI boot and corrupts the legacy
+                   environment, causing POST failures and black-screen hangs. */
+                struct {
+                    BBS_BBS_DEVICE_PATH      bbs;
+                    EFI_DEVICE_PATH_PROTOCOL end;
+                } pi_dp;
+
+                pi_dp.bbs.Header.Type = BBS_DEVICE_PATH;
+                pi_dp.bbs.Header.SubType = BBS_BBS_DP;
+                pi_dp.bbs.Header.Length[0] = sizeof(BBS_BBS_DEVICE_PATH);
+                pi_dp.bbs.Header.Length[1] = 0;
+                pi_dp.bbs.StatusFlag = 0;
+                pi_dp.bbs.String[0] = '\0';
+
+                pi_dp.end.Type = END_DEVICE_PATH_TYPE;
+                pi_dp.end.SubType = END_ENTIRE_DEVICE_PATH_SUBTYPE;
+                pi_dp.end.Length[0] = sizeof(EFI_DEVICE_PATH_PROTOCOL);
+                pi_dp.end.Length[1] = 0;
+
+                UINT16 pi_types[] = {
+                    want_type,
+                    BBS_TYPE_HARDDRIVE,
+                    BBS_TYPE_USB,
+                    BBS_TYPE_CDROM,
+                    BBS_TYPE_DEV,
+                    BBS_TYPE_UNKNOWN
+                };
+                for (UINTN pi_i = 0;
+                     pi_i < sizeof(pi_types)/sizeof(pi_types[0]); pi_i++) {
+                    pi_dp.bbs.DeviceType = pi_types[pi_i];
+                    ls = pi_csm->LegacyBoot(pi_csm, &pi_dp.bbs, 0, NULL);
+                    if (!EFI_ERROR(ls)) return;
+                }
+
+                /* Step 2c: try with NULL device path — some CSM implementations
+                   boot the highest-priority BBS entry when passed NULL. */
+                ls = pi_csm->LegacyBoot(pi_csm, NULL, 0, NULL);
+                if (!EFI_ERROR(ls)) return;
+            }
+
+            /* Firmware-specific fallback: use BootNext to jump to a likely
+               legacy boot option (often more reliable than BootIt on laptops). */
+            UINT16 legacy_bn = 0;
+            CHAR16 legacy_desc[LABEL_MAX];
+            EFI_STATUS bn_find = find_legacy_bootnext(target_disk, &legacy_bn, legacy_desc, LABEL_MAX);
+            if (!EFI_ERROR(bn_find)) {
+                EFI_STATUS bs = gRS->SetVariable(
+                    L"BootNext", &gEfiGlobalVariableGuid,
+                    EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS |
+                    EFI_VARIABLE_RUNTIME_ACCESS,
+                    sizeof(UINT16), &legacy_bn);
+
+                if (!EFI_ERROR(bs)) {
+                    gfx_clear(COL_BG_DARK);
+                    gfx_text_centered(gGfx.screen_w/2, gGfx.screen_h/2 - 30,
+                        L"Legacy protocol failed. Using BootNext fallback...", COL_YELLOW, 1);
+                    gfx_text_centered(gGfx.screen_w/2, gGfx.screen_h/2 + 4,
+                        legacy_desc, COL_TEXT_DIM, 1);
+                    gfx_flip();
+                    gBS->Stall(1200000);
+                    /* Try warm reset first — some firmware only processes
+                       BootNext on warm reset.  Fall through to cold if
+                       warm returns (should never happen). */
+                    gRS->ResetSystem(EfiResetWarm, EFI_SUCCESS, 0, NULL);
+                    gRS->ResetSystem(EfiResetCold, EFI_SUCCESS, 0, NULL);
+                    return;
+                }
+            }
+
+            /* Last resort: create a temporary Boot#### variable with a BBS
+               Hard Drive device path, set it as BootNext, and reboot.  This
+               forces the firmware to attempt a legacy/CSM boot from the hard
+               drive on next boot — even if there is no existing legacy entry
+               in the firmware's BootOrder. */
+            {
+                /* Build a minimal EFI_LOAD_OPTION with BBS HDD device path.
+                   Layout: Attributes(4) + FilePathListLength(2) +
+                           Description(UTF-16 NUL) + DevicePath */
+                CHAR16 *tmp_desc = L"MBR Guardian Legacy";
+                UINTN desc_bytes = (21) * sizeof(CHAR16); /* includes NUL */
+
+                struct {
+                    BBS_BBS_DEVICE_PATH      bbs;
+                    EFI_DEVICE_PATH_PROTOCOL end;
+                } __attribute__((packed)) tmp_dp;
+
+                tmp_dp.bbs.Header.Type     = BBS_DEVICE_PATH;
+                tmp_dp.bbs.Header.SubType  = BBS_BBS_DP;
+                tmp_dp.bbs.Header.Length[0] = (UINT8)sizeof(BBS_BBS_DEVICE_PATH);
+                tmp_dp.bbs.Header.Length[1] = 0;
+                tmp_dp.bbs.DeviceType      = BBS_TYPE_HARDDRIVE;
+                tmp_dp.bbs.StatusFlag      = 0;
+                tmp_dp.bbs.String[0]       = '\0';
+
+                tmp_dp.end.Type     = END_DEVICE_PATH_TYPE;
+                tmp_dp.end.SubType  = END_ENTIRE_DEVICE_PATH_SUBTYPE;
+                tmp_dp.end.Length[0] = (UINT8)sizeof(EFI_DEVICE_PATH_PROTOCOL);
+                tmp_dp.end.Length[1] = 0;
+
+                UINT16 fp_len = (UINT16)sizeof(tmp_dp);
+                UINTN var_len = 4 + 2 + desc_bytes + sizeof(tmp_dp);
+                UINT8 *var_buf = NULL;
+                EFI_STATUS alloc_s = gBS->AllocatePool(EfiBootServicesData, var_len, (void **)&var_buf);
+                if (!EFI_ERROR(alloc_s) && var_buf) {
+                    UINT8 *p = var_buf;
+                    /* Attributes: LOAD_OPTION_ACTIVE */
+                    UINT32 lo_attr = 1;
+                    gBS->CopyMem(p, &lo_attr, 4);     p += 4;
+                    gBS->CopyMem(p, &fp_len, 2);      p += 2;
+                    gBS->CopyMem(p, tmp_desc, desc_bytes); p += desc_bytes;
+                    gBS->CopyMem(p, &tmp_dp, sizeof(tmp_dp));
+
+                    /* Use Boot9999 as a scratch entry unlikely to collide. */
+                    UINT16 tmp_boot_num = 0x9999;
+                    EFI_STATUS vs = gRS->SetVariable(
+                        L"Boot9999", &gEfiGlobalVariableGuid,
+                        EFI_VARIABLE_NON_VOLATILE |
+                        EFI_VARIABLE_BOOTSERVICE_ACCESS |
+                        EFI_VARIABLE_RUNTIME_ACCESS,
+                        var_len, var_buf);
+
+                    if (!EFI_ERROR(vs)) {
+                        vs = gRS->SetVariable(
+                            L"BootNext", &gEfiGlobalVariableGuid,
+                            EFI_VARIABLE_NON_VOLATILE |
+                            EFI_VARIABLE_BOOTSERVICE_ACCESS |
+                            EFI_VARIABLE_RUNTIME_ACCESS,
+                            sizeof(UINT16), &tmp_boot_num);
+                    }
+
+                    gBS->FreePool(var_buf);
+
+                    if (!EFI_ERROR(vs)) {
+                        gfx_clear(COL_BG_DARK);
+                        gfx_text_centered(gGfx.screen_w/2, gGfx.screen_h/2 - 30,
+                            L"MBR written. Rebooting via legacy Boot entry...",
+                            COL_YELLOW, 1);
+                        gfx_text_centered(gGfx.screen_w/2, gGfx.screen_h/2 + 4,
+                            L"BootNext → Boot9999 (BBS HDD)", COL_TEXT_DIM, 1);
+                        gfx_flip();
+                        gBS->Stall(1500000);
+                        gRS->ResetSystem(EfiResetWarm, EFI_SUCCESS, 0, NULL);
+                        gRS->ResetSystem(EfiResetCold, EFI_SUCCESS, 0, NULL);
+                        return; /* should not reach */
+                    }
+                }
+            }
+
+            /* Should never reach here unless NVRAM write failed. */
+            set_skip_once(FALSE);
+
+            ui_dialog_info(L"Legacy Handoff Failed",
+                L"No legacy handoff path succeeded. Check CSM + boot order.");
+            if (!have_legacy_protocol && !have_pi_csm) {
+                set_status(L"No CSM protocol found; could not create legacy boot entry.");
+            } else {
+                set_status(L"CSM present but all handoff methods failed.");
+            }
             return;
         }
         if (mouse_clicked_rect(&btn_cancel.bounds)) return;
@@ -1614,6 +2311,11 @@ efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *systab)
     gBS = systab->BootServices;
     gRS = systab->RuntimeServices;
     gImageHandle = image_handle;
+
+    if (consume_skip_once()) {
+        /* One-shot passthrough requested by previous legacy boot attempt. */
+        return EFI_SUCCESS;
+    }
 
 #ifdef MBRG_ENTRY_RESET_TEST
     gRS->ResetSystem(EfiResetWarm, EFI_SUCCESS, 0, NULL);

@@ -256,6 +256,20 @@ sudo cp icons/*.bmp /boot/efi/EFI/mbr-guardian/icons/
 - No Secure Boot without custom signing.
 - Legacy boot handoff is firmware-dependent; tested with AMI/Phoenix/Insyde.
 
+## Legacy Boot Troubleshooting
+
+If `Boot` on a legacy snapshot shows `Legacy Boot Unavailable` or `Legacy Handoff Failed`:
+
+- Enable `CSM` / `Legacy Boot` in firmware setup.
+- Ensure the target disk is allowed in firmware legacy boot order.
+- Disable `UEFI-only` boot mode (vendor wording varies).
+- Some modern UEFI firmware has no legacy handoff protocol at all; in that case only UEFI chainloading works.
+
+Current fallback behavior:
+
+- If direct CSM handoff (`LegacyBoot` protocol) fails, MBR Guardian tries a `BootNext` fallback to a likely legacy boot target (`USB HDD` for removable media, otherwise `NVMe/ATA/HDD`).
+- If firmware still returns to MBR Guardian, the app uses a one-shot passthrough flag to avoid getting stuck in a reboot loop.
+
 ## License
 
 MIT License
