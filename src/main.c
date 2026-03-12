@@ -315,6 +315,60 @@ wstrlen(const CHAR16 *s)
     return n;
 }
 
+static INTN
+compare_efi_time_desc(const EFI_TIME *a, const EFI_TIME *b)
+{
+    if (a->Year != b->Year) return (a->Year > b->Year) ? -1 : 1;
+    if (a->Month != b->Month) return (a->Month > b->Month) ? -1 : 1;
+    if (a->Day != b->Day) return (a->Day > b->Day) ? -1 : 1;
+    if (a->Hour != b->Hour) return (a->Hour > b->Hour) ? -1 : 1;
+    if (a->Minute != b->Minute) return (a->Minute > b->Minute) ? -1 : 1;
+    if (a->Second != b->Second) return (a->Second > b->Second) ? -1 : 1;
+    if (a->Nanosecond != b->Nanosecond) return (a->Nanosecond > b->Nanosecond) ? -1 : 1;
+    return 0;
+}
+
+static void
+sort_snapshots(void)
+{
+    for (UINTN i = 0; i < gSnaps.count; i++) {
+        UINTN best = i;
+
+        for (UINTN j = i + 1; j < gSnaps.count; j++) {
+            INTN cmp = compare_efi_time_desc(&gSnaps.entries[j].timestamp,
+                                             &gSnaps.entries[best].timestamp);
+
+            if (cmp < 0) {
+                best = j;
+                continue;
+            }
+
+            if (cmp == 0) {
+                if (gSnaps.entries[j].disk_index < gSnaps.entries[best].disk_index ||
+                    (gSnaps.entries[j].disk_index == gSnaps.entries[best].disk_index &&
+                     gSnaps.entries[j].mbr_hash < gSnaps.entries[best].mbr_hash)) {
+                    best = j;
+                }
+            }
+        }
+
+        if (best != i) {
+            MBR_SNAPSHOT tmp_entry = gSnaps.entries[i];
+            CHAR16 tmp_filename[PATH_MAX];
+            ICON_IMAGE *tmp_icon = gSnaps.icons[i];
+
+            gSnaps.entries[i] = gSnaps.entries[best];
+            gSnaps.icons[i] = gSnaps.icons[best];
+            wstrcpy(tmp_filename, gSnaps.filenames[i], PATH_MAX);
+
+            gSnaps.entries[best] = tmp_entry;
+            gSnaps.icons[best] = tmp_icon;
+            wstrcpy(gSnaps.filenames[i], gSnaps.filenames[best], PATH_MAX);
+            wstrcpy(gSnaps.filenames[best], tmp_filename, PATH_MAX);
+        }
+    }
+}
+
 static CHAR16
 to_lower_ascii(CHAR16 c)
 {
@@ -908,6 +962,7 @@ load_snapshots(void)
     }
 
     dir->Close(dir);
+    sort_snapshots();
     return EFI_SUCCESS;
 }
 
